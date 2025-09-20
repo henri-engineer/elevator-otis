@@ -15,45 +15,160 @@ MPU-6050 Accelerometer & Gyroscope - [VCC: 3.3V + GND: GND + Serial Clock(SCL): 
 */
 
 //Libraries
+#include "secrets.h"
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "WiFi.h"
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include "DHT.h"
 
-//ESP32 Pinage setup
-const int magneticSensorPin = 23;   // Digital output for Magnetic Reed Switch Sensor
-const int currentSensorPin = 2;     // Analog output for Current Sensor
-const int temperatureSensorPin = 4; // Analog output for DHT Sensor 
-const int IN1 = 25;                 // L298N In 1
-const int IN2 = 26;                 // L298N In 2
+#define AWS_IOT_PUBLISH_TOPIC   "esp32/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "esp32/sub"
+
+//Pinage setup
+//Reed Switches
+#define magneticSensorPin1stFloor 23   // Digital output for Magnetic Reed Switch Sensor 1st floor
+#define magneticSensorPin2ndFloor 19   // Digital output for Magnetic Reed Switch Sensor 2nd floor
+#define magneticSensorPin3rdFloor 18   // Digital output for Magnetic Reed Switch Sensor 3rd floor
+#define magneticSensorPin4thFloor 5   // Digital output for Magnetic Reed Switch Sensor 4th floor
+
+//Temperature
+#define temperatureSensorPin 4        // Analog output for DHT Sensor
+#define DHTTYPE DHT11
+float t;
+float tcabine;
+DHT dht(temperatureSensorPin, DHTTYPE);
+
+//Current
+#define currentSensorPin 34          // Analog output for Current Sensor
+float current = 0;
+const float sensitivity = 0.100; // 100 mV/A (20A)
+const float Vref = 3.3;          // Tensão de referência ADC ESP32
+int offsetRaw = 0;               // Offset calibrado (ADC)
+float offsetVoltage = 0;         // Offset calibrado (Volts)
+
+//Engine and L298N
+#define IN1 25                 // L298N In 1
+#define IN2 26                 // L298N In 2
+#define ENA 27                 // PWM
+
+//Buttons
 const int BUTTON_1ST = 32;          // 1st floor action button
 const int BUTTON_2ND = 33;          // 2nd floor action button
 const int BUTTON_3RD = 12;          // 3rd floor action button
 const int BUTTON_4TH = 14;          // 4th floor action button
 
-//Accelerometer Global Variables
+//Accelerometer
 Adafruit_MPU6050 mpu;
+float accelerometerX;
+float accelerometerY;
+float accelerometerZ;
+float gyroscopeX;
+float gyroscopeY;
+float gyroscopeZ;
 
-//Temperature Global Variables
-#define DHTTYPE DHT11
-DHT dht(temperatureSensorPin, DHTTYPE);
+WiFiClientSecure net = WiFiClientSecure();
+PubSubClient client(net);
 
-//Current Sensor Global Variables
-float R1 = 6800.0;
-float R2 = 12000.0;
-float t = 0;
+void connectAWS(){
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.println("Connecting to Wi-Fi");
+ 
+  while (WiFi.status() != WL_CONNECTED){
+    delay(500);
+    Serial.print(".");
+  }
+ 
+  // Configure WiFiClientSecure to use the AWS IoT device credentials
+  net.setCACert(AWS_CERT_CA);
+  net.setCertificate(AWS_CERT_CRT);
+  net.setPrivateKey(AWS_CERT_PRIVATE);
+ 
+  // Connect to the MQTT broker on the AWS endpoint we defined earlier
+  client.setServer(AWS_IOT_ENDPOINT, 8883);
+ 
+  // Create a message handler
+  client.setCallback(messageHandler);
+  Serial.println("Connecting to AWS IOT");
+ 
+  while (!client.connect(THINGNAME)){
+    Serial.print(".");
+    delay(500);
+  }
+ 
+  if (!client.connected()){
+    Serial.println("AWS IoT Timeout!");
+    return;
+  }
+  // Subscribe to a topic
+  client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+  Serial.println("AWS IoT Connected!");
+}
+
+void publishMessage(){
+  StaticJsonDocument<200> doc;
+  doc["temperature"] = t;
+  doc["cabineTemperature"] = tcabine;
+  doc["current"] = current;
+  JsonObject accelerometer = doc.createNestedObject("accelerometer");
+  accelerometer["x"] = accelerometerX;
+  accelerometer["y"] = accelerometerY;
+  accelerometer["z"] = accelerometerZ;
+
+  char jsonBuffer[512];
+  serializeJson(doc, jsonBuffer); // print to client
+ 
+  client.publish(AWS_IOT_PUBLISH_TOPIC, jsonBuffer);
+}
+ 
+void messageHandler(char* topic, byte* payload, unsigned int length){
+  Serial.print("incoming: ");
+  Serial.println(topic);
+ 
+  StaticJsonDocument<200> doc;
+  deserializeJson(doc, payload);
+  const char* message = doc["message"];
+  Serial.println(message);
+}
 
 void setup() {
   Serial.begin(115200);
   pinMode(IN1, OUTPUT);                       //H bridge
   pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  digitalWrite(ENA, HIGH);
   pinMode(BUTTON_1ST, INPUT_PULLUP);          //Buttons
   pinMode(BUTTON_2ND, INPUT_PULLUP);
   pinMode(BUTTON_3RD, INPUT_PULLUP);
   pinMode(BUTTON_4TH, INPUT_PULLUP);
-  pinMode(magneticSensorPin, INPUT);          //Reed Switch Sensor
+  pinMode(magneticSensorPin1stFloor, INPUT_PULLUP);          //Reed Switch Sensor
+  pinMode(magneticSensorPin2ndFloor, INPUT_PULLUP);
+  pinMode(magneticSensorPin3rdFloor, INPUT_PULLUP);
+  pinMode(magneticSensorPin4thFloor, INPUT_PULLUP);
+
   pinMode(currentSensorPin, INPUT);           //ACS712 Sensor
   dht.begin();                                //DHT Temperature sensor initializing
+  connectAWS();
+  // --- Calibração do ACS712 ---
+  long soma = 0;
+  int n = 500;  // número de amostras para calibrar
+  Serial.println("Calibrando ACS712...");
+  for (int i = 0; i < n; i++) {
+    soma += analogRead(currentSensorPin);
+    delay(2);
+  }
+  offsetRaw = soma / n;
+  offsetVoltage = (offsetRaw / 4095.0) * Vref;
+  Serial.print("Offset ADC: ");
+  Serial.print(offsetRaw);
+  Serial.print(" (");
+  Serial.print(offsetVoltage);
+  Serial.println(" V)");
+  Serial.println("Calibração concluída");
   if (!mpu.begin()) Serial.println("Failed to find MPU6050 chip"); //Accelerometer initializing
   else Serial.println("MPU6050 Found!");
 
@@ -119,19 +234,16 @@ void setup() {
 
 void loop() {
   //Magnetic Sensors Portion
-  int magneticSensorValue = digitalRead(magneticSensorPin);
-  Serial.print("Magnetic Sensor Value: ");
-  Serial.println(magneticSensorValue);
+  int sensor1 = digitalRead(magneticSensorPin1stFloor);
+  int sensor2 = digitalRead(magneticSensorPin2ndFloor);
+  int sensor3 = digitalRead(magneticSensorPin3rdFloor);
+  int sensor4 = digitalRead(magneticSensorPin4thFloor);
 
-  //Current Sensor Portion
-  int adc = analogRead(currentSensorPin);
-  Serial.print("Current Analog Value: ");
-  Serial.println(adc);
-  float adc_voltage = adc * (3.3 / 4096.0);
-  float current_voltage = (adc_voltage * (R1+R2)/R2);
-  float current = (current_voltage - 2.5) / 0.100;
-  Serial.print("Current Value: ");
-  Serial.println(current);
+  Serial.print("Andar 1: "); Serial.print(sensor1);
+  Serial.print(" | Andar 2: "); Serial.print(sensor2);
+  Serial.print(" | Andar 3: "); Serial.print(sensor3);
+  Serial.print(" | Andar 4: "); Serial.println(sensor4);
+
 
   //Temperature Portion
   t = dht.readTemperature();
@@ -165,6 +277,18 @@ void loop() {
   
   Serial.println("==============#==============");
 
+  //Corrente
+  int raw = analogRead(currentSensorPin);
+  Serial.print("Current Pin Analog Read: ");
+  Serial.println(raw);
+  float voltage = (raw / 4095.0) * Vref;
+  float voltageDiff = voltage - offsetVoltage; // subtrai offset
+  current = voltageDiff / sensitivity; // calcula corrente (A)
+
+  Serial.print("Corrente: ");
+  Serial.print(current, 3);
+  Serial.println("A");
+
   bool btn1Pressed = digitalRead(BUTTON_1ST) == LOW;
   bool btn2Pressed = digitalRead(BUTTON_2ND) == LOW;
   bool btn3Pressed = digitalRead(BUTTON_3RD) == LOW;
@@ -190,6 +314,7 @@ void loop() {
     digitalWrite(IN1, LOW);
     digitalWrite(IN2, LOW);  // Stopped engine
   }
+  publishMessage();
+  client.loop();
   delay(2000);
 }
-
